@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
+use lazy_static::lazy_static;
 use regex::Regex;
 use serde_derive::Deserialize;
 
@@ -28,6 +29,7 @@ pub struct Apt {
     warning_updates_regex: Option<Regex>,
     critical_updates_regex: Option<Regex>,
     config_path: String,
+    ignore_waiting_phased_updates: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -54,6 +56,9 @@ pub struct AptConfig {
     /// Indicate a `critical` state for the block if any pending update match the following regex.
     /// Default behaviour is that no package updates are deemed critical
     pub critical_updates_regex: Option<String>,
+
+    /// Removes phased updates under 100% from the update count
+    pub ignore_waiting_phased_updates: bool,
 }
 
 impl Default for AptConfig {
@@ -65,6 +70,7 @@ impl Default for AptConfig {
             format_up_to_date: FormatTemplate::default(),
             warning_updates_regex: None,
             critical_updates_regex: None,
+            ignore_waiting_phased_updates: false,
         }
     }
 }
@@ -119,6 +125,7 @@ impl ConfigBlock for Apt {
                 .transpose()
                 .error_msg("invalid critical updates regex")?,
             config_path: cache_dir.into_os_string().into_string().unwrap(),
+            ignore_waiting_phased_updates: block_config.ignore_waiting_phased_updates,
         })
     }
 }
@@ -157,6 +164,45 @@ fn get_update_count(updates: &str) -> usize {
         .count()
 }
 
+fn get_update_count_ignore_waiting_phased(config_path: &str, updates: &str) -> Result<usize> {
+    let non_phased_updates = updates
+        .lines()
+        .filter(|line| line.contains("[upgradable"))
+        .filter_map(|line| match is_waiting_phased_update(config_path, line) {
+            Ok(true) => Some(Ok(true)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<bool>>>()?;
+
+    Ok(non_phased_updates.iter().count())
+}
+
+fn is_waiting_phased_update(config_path: &str, package_line: &str) -> Result<bool> {
+    lazy_static! {
+        static ref PHASED_REGEX: Regex = Regex::new(r#".*\(phased (\d+)%\).*"#).unwrap();
+        static ref PACKAGE_NAME_REGEX: Regex = Regex::new(r#"(.*)/.*"#).unwrap();
+    }
+
+    let package_name = &PACKAGE_NAME_REGEX
+        .captures(package_line)
+        .error_msg("Couldn't find package name")?[1];
+
+    let output = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", config_path, "apt-cache policy", package_name])
+            .output()
+            .error_msg("Problem running apt-cache command")?
+            .stdout,
+    )
+    .error_msg("Problem capturing apt-cache command output")?;
+
+    Ok(match PHASED_REGEX.captures(&output) {
+        Some(matches) => &matches[1] != "100",
+        None => false,
+    })
+}
+
 impl Block for Apt {
     fn name(&self) -> &'static str {
         "apt"
@@ -169,7 +215,11 @@ impl Block for Apt {
     fn update(&mut self) -> Result<Option<Update>> {
         let (formatting_map, warning, critical, cum_count) = {
             let updates_list = get_updates_list(&self.config_path)?;
-            let count = get_update_count(&updates_list);
+            let count = if self.ignore_waiting_phased_updates {
+                get_update_count_ignore_waiting_phased(&self.config_path, &updates_list)?
+            } else {
+                get_update_count(&updates_list)
+            };
             let formatting_map = map!(
                 "count" => Value::from_integer(count as i64)
             );
